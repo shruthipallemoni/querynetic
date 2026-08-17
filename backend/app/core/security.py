@@ -13,6 +13,7 @@ Calling bcrypt directly is simpler and avoids that broken compatibility layer.
 import bcrypt
 from datetime import datetime, timedelta
 from jose import jwt
+from cryptography.fernet import Fernet
 from app.core.config import settings
 
 
@@ -28,10 +29,34 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     )
 
 
-def create_access_token(data: dict, expires_minutes: int = 60) -> str:
+# Separate from password hashing: this is REVERSIBLE encryption, used only
+# for database connection strings — we need the real credential back to
+# actually connect, unlike a password hash, which never needs to be undone.
+_fernet = Fernet(settings.ENCRYPTION_KEY.encode("utf-8"))
+
+
+def encrypt_string(plain_text: str) -> str:
+    return _fernet.encrypt(plain_text.encode("utf-8")).decode("utf-8")
+
+
+def decrypt_string(encrypted_text: str) -> str:
+    return _fernet.decrypt(encrypted_text.encode("utf-8")).decode("utf-8")
+
+
+def create_access_token(data: dict) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=expires_minutes)
-    to_encode.update({"exp": expire})
+    expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    # "type" claim lets every endpoint verify it received the KIND of
+    # token it expects — an access token can't be used as a refresh token
+    # even though both are just JWTs, and vice versa.
+    to_encode.update({"exp": expire, "type": "access"})
+    return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def create_refresh_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "type": "refresh"})
     return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 

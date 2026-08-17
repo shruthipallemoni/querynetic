@@ -1,55 +1,75 @@
 """
-HTTP endpoint(s) that the React frontend calls.
+HTTP endpoint that the React frontend calls to ask a question.
 
-Job: receive a question, pass it into the agent pipeline (graph.py), and
-return the final answer. This file should be thin — it translates between
-"HTTP request" and "pipeline input," nothing more.
+Job: load this conversation's real message history from the database,
+run the pipeline with it as context, then persist both the question and
+the answer as new Message rows.
 
-IMPORTANT: this is where per-turn state resetting happens. The checkpointer
-persists the ENTIRE state between calls, not just conversation history —
-so every field except `messages` must be explicitly reset here on each new
-question. Otherwise leftover data from a previous, unrelated question
-(a stale retry_count, an old validation_result) could silently affect the
-new one.
+This REPLACES relying on the graph's in-memory checkpointer for cross-
+request memory — that was flagged early on as fragile (lost on restart,
+doesn't work across multiple server processes). Reconstructing history
+from a real database table on every request fixes that, and it's the
+same table the conversation history sidebar reads from — one source of
+truth for both jobs.
 """
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from app.graph import analyst_graph
 from app.core.deps import get_current_user
+from app.core.db import get_db
 from app.models.user import User
+from app.models.conversation import Conversation
+from app.models.message import Message
 
 router = APIRouter()
 
 
 class ChatRequest(BaseModel):
     question: str
-    database_id: str
-    thread_id: str
+    conversation_id: int
+
+
+def _load_history(conversation_id: int, db: Session) -> list:
+    rows = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at.asc())
+        .all()
+    )
+    history = []
+    for row in rows:
+        if row.role == "user":
+            history.append(HumanMessage(content=row.content))
+        elif row.role == "assistant":
+            history.append(AIMessage(content=row.content))
+        # "error" rows are intentionally excluded from context — a failed
+        # attempt shouldn't shape how the model interprets later questions.
+    return history
 
 
 @router.post("/")
 def ask_question(
     payload: ChatRequest,
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    question = payload.question
-    database_id = payload.database_id
-    thread_id = payload.thread_id
-    # thread_id identifies the CONVERSATION — the same value across
-    # multiple questions is what lets the checkpointer load prior history.
-    config = {"configurable": {"thread_id": thread_id}}
+    conversation = (
+        db.query(Conversation)
+        .filter(Conversation.id == payload.conversation_id, Conversation.user_id == current_user.id)
+        .first()
+    )
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    history = _load_history(conversation.id, db)
 
     turn_input = {
-        "question": question,
-        "database_id": database_id,
-        # Only new item passed for `messages` — the add_messages reducer
-        # merges this into whatever history the checkpointer already has,
-        # it does NOT replace it.
-        "messages": [HumanMessage(content=question)],
-        # Everything else below has no reducer, so passing fresh values
-        # here overwrites any leftover data from the previous question.
+        "question": payload.question,
+        "database_id": conversation.database_id,
+        "messages": history + [HumanMessage(content=payload.question)],
         "plan": {},
         "retrieved_schema": [],
         "generated_queries": [],
@@ -61,7 +81,31 @@ def ask_question(
         "error": None,
     }
 
-    result = analyst_graph.invoke(turn_input, config=config)
+    result = analyst_graph.invoke(
+        turn_input,
+        config={"configurable": {"thread_id": f"conversation-{conversation.id}"}},
+    )
+
+    # Persist the user's question.
+    db.add(Message(conversation_id=conversation.id, role="user", content=payload.question))
+
+    # First message in a new conversation becomes its title — same pattern
+    # as ChatGPT-style history sidebars, so nothing needs manual naming.
+    if conversation.title == "New conversation":
+        conversation.title = payload.question[:60]
+
+    if result.get("error"):
+        db.add(Message(conversation_id=conversation.id, role="error", content=result["error"]))
+    else:
+        db.add(Message(
+            conversation_id=conversation.id,
+            role="assistant",
+            content=result.get("final_answer", ""),
+            queries=result.get("generated_queries", []),
+            validated=result.get("validation_result", {}).get("is_valid", False),
+        ))
+
+    db.commit()
 
     return {
         "answer": result.get("final_answer"),
